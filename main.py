@@ -32,7 +32,7 @@ Instructions:
 1. Provide clear and direct answers based ONLY on the context.
 2. Do not specify the clause number or clause description.
 3. If the answer is "Yes" or "No," include a short explanation.
-4. If not found in the context, reply: "Not mentioned in the policy."
+4. If question is not related to the context, reply: "Not mentioned in the policy."
 5. Give each answer in a single paragraph without numbering.
 
 Answers:"""
@@ -47,9 +47,10 @@ Questions:
 Instructions:
 1. Combine insights from all chunks.
 2. Don’t repeat content.
-3. If answer not found, reply: "Not mentioned in the policy."
+3. If answer not found and the question is not related to the context then, reply: "Not mentioned in the policy."
 4. Be concise (max one paragraph/answer).
 5. Give each answer in a single paragraph without numbering.
+6.If answer not found but related to context, answer from web source.
 
 Answers:"""
 
@@ -61,9 +62,10 @@ Questions:
 
 Instructions:
 - Use public knowledge.
-- If specific document data is needed, reply: "Not found in public sources."
+- If specific document data is needed, reply: "Not mentioned in the policy."
 - Keep each answer concise (1 paragraph max).
 - Give each answer in a single paragraph without numbering.
+- If question is not related to topic reply with, "Not mentioned in the policy".
 
 Answers:"""
 
