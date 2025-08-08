@@ -65,7 +65,6 @@ Instructions:
 - If specific document data is needed, reply: "Not mentioned in the policy."
 - Keep each answer concise (1 paragraph max).
 - Give each answer in a single paragraph without numbering.
-- If question is not related to topic reply with, "Not mentioned in the policy".
 
 Answers:"""
 
