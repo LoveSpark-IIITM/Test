@@ -3,7 +3,7 @@ uvicorn[standard]
 pydantic
 python-dotenv
 requests
-httpx
+httpx[http2]
 PyMuPDF
 pillow
 pytesseract
