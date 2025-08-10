@@ -1,20 +1,16 @@
 from fastapi import FastAPI, HTTPException, Header
 from pydantic import BaseModel
 from typing import List
-import os, tempfile, io, time, re
-import fitz
+import os, requests, fitz, tempfile, io, asyncio, time, re, json
 from PIL import Image
 import pytesseract
-import requests, httpx
-import asyncio
+import httpx
 from dotenv import load_dotenv
+from bs4 import BeautifulSoup
 
-# ---------------- App & Clients ----------------
-app = FastAPI()
-
-import urllib3
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
+
 
 REQUESTS_SESSION = requests.Session()
 REQUESTS_SESSION.headers.update({"Accept-Encoding": "gzip, deflate"})
@@ -26,30 +22,19 @@ REQUESTS_SESSION.mount(
     ),
 )
 
-ASYNC_CLIENT = httpx.AsyncClient(
-    http2=True,
-    timeout=35.0,
-    headers={"Accept-Encoding": "gzip, deflate"},
-    limits=httpx.Limits(max_connections=20, max_keepalive_connections=10),
-)
-
-@app.on_event("shutdown")
-async def shutdown_event():
-    await ASYNC_CLIENT.aclose()
-
 load_dotenv()
 
-MISTRAL_API_KEY = os.getenv("MISTRAL_API_KEY")
-GROQ_API_KEY    = os.getenv("GROQ_API_KEY")
-API_TOKEN       = os.getenv("API_TOKEN")
+#pytesseract.pytesseract.tesseract_cmd = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
 
-# ---------------- Schemas ----------------
+MISTRAL_API_KEY = os.getenv("MISTRAL_API_KEY")
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+API_TOKEN = os.getenv("API_TOKEN")
+
+app = FastAPI()
 
 class RunRequest(BaseModel):
     documents: str
     questions: List[str]
-
-# ---------------- Prompts ----------------
 
 FULL_PROMPT_TEMPLATE = """You are an insurance policy expert. Use ONLY the information provided in the context to answer the questions.
 Context:
@@ -62,35 +47,27 @@ Instructions:
 1. Provide clear and direct answers based ONLY on the context.
 2. Do not specify the clause number or clause description.
 3. If the answer is "Yes" or "No," include a short explanation.
-4. If not found in the context, reply: "Not mentioned in the policy."
+4. If question is not related to the context, reply: "Not mentioned in the policy."
 5. Give each answer in a single paragraph without numbering.
 
 Answers:"""
 
-CHUNK_PROMPT_TEMPLATE = """You are an insurance policy specialist. Prefer answers from the policy <Context>. If and only if the policy lacks the answer, you may use <WebSnippets>.
-
-Decision rule:
-1) Search ALL of <Context>. If the answer exists there, answer ONLY from <Context>.
-2) If the answer is NOT in <Context>, search <WebSnippets>. If found there, answer from <WebSnippets> and keep it concise.
-3) If the answer is in neither source, reply exactly: "Not mentioned in the policy."
-
-Requirements:
-- Quote every number, amount, time period, percentage, sub-limit, definition, eligibility, exclusion, waiting period, and condition *word-for-word*.
-- If Yes/No, start with “Yes.” or “No.” and immediately quote the rule that makes it so.
-- Include all applicable conditions in a compact way.
-- No clause numbers, no speculation, no invented facts.
-
+CHUNK_PROMPT_TEMPLATE = """You are an insurance policy expert. Use ONLY the chunked context and questions to answer.
 Context:
 {context}
-
-WebSnippets:
-{web_snippets}
 
 Questions:
 {query}
 
-Answers (one concise paragraph per question, no bullets, no numbering):
-"""
+Instructions:
+1. Combine insights from all chunks.
+2. Don’t repeat content.
+3. If answer not found and the question is not related to the context then, reply: "Not mentioned in the policy."
+4. Be concise (max one paragraph/answer).
+5. Give each answer in a single paragraph without numbering.
+6.If answer not found but related to context, answer from web source.
+
+Answers:"""
 
 WEB_PROMPT_TEMPLATE = """You are an expert insurance policy assistant. Based on the document titled "{title}", answer the following questions using general or public insurance knowledge.
 Title: "{title}"
@@ -100,262 +77,358 @@ Questions:
 
 Instructions:
 - Use public knowledge.
-- If specific document data is needed, reply: "Not found in public sources."
+- If specific document data is needed, reply: "Not mentioned in the policy."
 - Keep each answer concise (1 paragraph max).
 - Give each answer in a single paragraph without numbering.
+- If question is not related to topic reply with, "Not mentioned in the policy".
 
 Answers:"""
 
-# ---------------- Helpers ----------------
+PUZZLE_PROMPT_TEMPLATE = """You are a puzzle-solving expert.
+You are given the full text of a PDF and the outputs from any instructions that were executed from the PDF.
+Use BOTH the PDF content and the executed instruction outputs to solve the puzzle hidden inside.
+
+PDF Content:
+{pdf_text}
+
+Executed Instruction Results:
+{instruction_results}
+
+Task:
+- Solve the puzzle and return ONLY the final answer (no explanation, no steps, no reasoning).
+- The output must be a single sentence.
+
+FINAL ANSWER:"""
+
+# ---------------- Instruction Detection ----------------
+INSTRUCTION_RX = re.compile(
+    r'\b(POST|GET|PUT|DELETE)\s+(https?://[^\s]+)(?:\s*({.*?}))?',
+    re.IGNORECASE | re.DOTALL
+)
+
+def find_and_execute_instructions(text: str):
+    results = []
+    for match in INSTRUCTION_RX.finditer(text):
+        method = match.group(1).upper()
+        url = match.group(2).strip()
+        body_raw = match.group(3)
+
+        try:
+            if method == "GET":
+                resp = REQUESTS_SESSION.get(url, timeout=15)
+            elif method in {"POST", "PUT", "DELETE"}:
+                if body_raw:
+                    try:
+                        body_json = json.loads(body_raw)
+                        resp = REQUESTS_SESSION.request(method, url, json=body_json, timeout=15)
+                    except Exception:
+                        resp = REQUESTS_SESSION.request(method, url, data=body_raw, timeout=15)
+                else:
+                    resp = REQUESTS_SESSION.request(method, url, timeout=15)
+            else:
+                continue
+
+            try:
+                content = resp.json()
+            except Exception:
+                content = resp.text[:1000]
+
+            results.append({
+                "method": method,
+                "url": url,
+                "status": resp.status_code,
+                "response": content
+            })
+        except Exception as e:
+            results.append({
+                "method": method,
+                "url": url,
+                "error": str(e)
+            })
+    return results
 
 
 
 
-def approx_tokens_from_text(s: str) -> int:
-    return max(1, len(s) // 4)
-
-def choose_mistral_params(page_count: int, context_text: str | None):
-    ctx_tok = approx_tokens_from_text(context_text or "")
-    if page_count <= 100:
-        max_tokens, temperature, timeout = 1100, 0.20, 15
-    elif page_count <= 200:
-        max_tokens, temperature, timeout = 1400, 0.22, 15
-    else:
-        max_tokens, temperature, timeout = 800, 0.18, 12
-    total_budget = 3500
-    budget_left = max(600, total_budget - ctx_tok)
-    return {"max_tokens": min(max_tokens, budget_left), "temperature": temperature, "timeout": timeout}
-
-def choose_groq_params(page_count: int, context_text: str | None):
-    ctx_tok = approx_tokens_from_text(context_text or "")
-    if page_count <= 100:
-        max_tokens, temperature, timeout = 1300, 0.2, 30
-    elif page_count <= 200:
-        max_tokens, temperature, timeout = 1700, 0.2, 30
-    else:
-        max_tokens, temperature, timeout = 1100, 0.13, 25
-    total_budget = 3500
-    budget_left = max(800, total_budget - ctx_tok)
-    return {"max_tokens": min(max_tokens, budget_left), "temperature": temperature, "timeout": timeout}
-
-
-
-
-
-def make_question_block(questions: List[str]) -> str:
-    return "\n".join(f"{i+1}. {q}" for i, q in enumerate(questions))
-
-# ---------------- PDF Extraction ----------------
-
-
+# Extract text from PDF (OCR if needed)
 def extract_text_from_pdf_url(pdf_url: str) -> tuple[str, int, str]:
-    r = REQUESTS_SESSION.get(pdf_url, timeout=20)
-    r.raise_for_status()
+    response = requests.get(pdf_url)
+    response.raise_for_status()
+
     with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
-        tmp.write(r.content)
+        tmp.write(response.content)
         tmp_path = tmp.name
 
-    full_text, title = "", ""
+    full_text = ""
+    title = ""
     with fitz.open(tmp_path) as doc:
         page_count = len(doc)
 
-        # Title
+        # Title extraction
         for i in range(min(15, page_count)):
-            t = (doc[i].get_text() or "").strip()
-            if not t:
+            page = doc[i]
+            text = page.get_text().strip()
+
+            if not text:
                 try:
-                    pix = doc[i].get_pixmap(dpi=100)
+                    pix = page.get_pixmap(dpi=100)
                     img = Image.open(io.BytesIO(pix.tobytes("png")))
-                    t = pytesseract.image_to_string(img, lang="eng").strip()
-                except Exception:
+                    text = pytesseract.image_to_string(img, lang="eng").strip()
+                except:
                     continue
-            if t:
-                title = t.splitlines()[0][:100]
+
+            if text:
+                title = text.split('\n')[0][:100]
                 break
 
-        # Full text (<=200 pages)
-
-
+        # Full extraction only if ≤ 200 pages
         if page_count <= 200:
             for i in range(page_count):
-                t = (doc[i].get_text() or "").strip()
-                if not t:
+                page = doc[i]
+                text = page.get_text().strip()
+
+                if not text:
                     try:
-                        pix = doc[i].get_pixmap(dpi=100)
+                        pix = page.get_pixmap(dpi=100)
                         img = Image.open(io.BytesIO(pix.tobytes("png")))
-                        t = pytesseract.image_to_string(img, lang="eng").strip()
-                    except Exception:
-                        t = ""
-                if t:
-                    full_text += t + "\n"
+                        text = pytesseract.image_to_string(img, lang="eng").strip()
+                    except:
+                        continue
+
+                full_text += text + "\n"
 
     os.remove(tmp_path)
     return (full_text.strip() if page_count <= 200 else "", page_count, title or "Untitled Document")
 
-def split_text(text: str, chunk_size=1200, overlap=150) -> List[str]:
+def extract_text_from_web_url(web_url: str) -> tuple[str, int, str]:
+    """
+    Fetch HTML content from a webpage and extract readable text.
+    Returns (full_text, page_count_placeholder, title)
+    page_count is 1 for web content to fit into parameter choices
+    """
+    r = REQUESTS_SESSION.get(web_url, timeout=20)
+    r.raise_for_status()
+
+    soup = BeautifulSoup(r.text, "html.parser")
+
+    # Title
+    title = soup.title.string.strip() if soup.title and soup.title.string else "Untitled Webpage"
+
+    # Remove scripts/styles
+    for tag in soup(["script", "style", "noscript"]):
+        tag.extract()
+
+    # Extract visible text and try to collapse redundant whitespace
+    text = "\n".join(line.strip() for line in soup.get_text(separator="\n").splitlines() if line.strip())
+
+    return (text.strip(), 1, title)
+
+def split_text(text: str, chunk_size=1500, overlap=200) -> List[str]:
     chunks, start = [], 0
-    n = len(text)
-    while start < n and len(chunks) < 15:
+    while start < len(text):
         chunks.append(text[start:start + chunk_size])
         start += chunk_size - overlap
-    return chunks
+    return chunks[:10]
 
-# ---------------- LLM Calls ----------------
-
-
-def call_mistral(prompt: str, params: dict) -> str:
+# Mistral LLM
+def call_mistral(prompt: str) -> str:
     url = "https://api.mistral.ai/v1/chat/completions"
-    headers = {"Authorization": f"Bearer {MISTRAL_API_KEY}", "Content-Type": "application/json"}
+    headers = {
+        "Authorization": f"Bearer {MISTRAL_API_KEY}",
+        "Content-Type": "application/json"
+    }
     payload = {
         "model": "mistral-small-latest",
-        "temperature": params.get("temperature", 0.3),
+        "temperature": 0.7,
         "top_p": 1,
-        "max_tokens": params.get("max_tokens", 1000),
-        "messages": [{"role": "user", "content": prompt}],
+        "max_tokens": 1000,
+        "messages": [{"role": "user", "content": prompt}]
     }
-    r = REQUESTS_SESSION.post(url, headers=headers, json=payload, timeout=params.get("timeout", 15))
-    r.raise_for_status()
-    return r.json()["choices"][0]["message"]["content"]
+    res = requests.post(url, headers=headers, json=payload, timeout=15)
+    res.raise_for_status()
+    return res.json()["choices"][0]["message"]["content"]
 
-def _score_chunk(q: str, c: str) -> int:
-    WORD_RX = re.compile(r"\w+")
-    NUM_RX  = re.compile(r"\d+%?")
-    qt = set(WORD_RX.findall(q.lower()))
-    ct = set(WORD_RX.findall(c.lower()))
-    base = len(qt & ct)
-    num_bonus = 2 * len(set(NUM_RX.findall(q)) & set(NUM_RX.findall(c)))
-    return base + num_bonus
+def call_grok(prompt: str)->str:
+    url="https://api.groq.com/openai/v1/chat/completions"
+    headers = {
+        "Authorization": f"Bearer {GROQ_API_KEY}",
+        "Content-Type": "application/json"
+    }
+    payload = {
+            "model": "meta-llama/llama-4-scout-17b-16e-instruct",
+            "temperature": 0.3,
+            "top_p": 1,
+            "max_tokens": 1000,
+            "messages": [{"role": "user", "content": prompt}]
+        }
+    res = requests.post(url, headers=headers, json=payload, timeout=15)
+    res.raise_for_status()
+    return res.json()["choices"][0]["message"]["content"]
 
-def _topk_chunks(q: str, chunks: List[str], k=4) -> List[str]:
-    scored = sorted((( _score_chunk(q, c), c) for c in chunks), key=lambda x: x[0], reverse=True)
-    return [c for _, c in scored[:k]] if scored else []
+def call_mistral_on_chunks(chunks: List[str], questions: List[str]) -> List[str]:
+    question_block = "\n".join([f"{i+1}. {q}" for i, q in enumerate(questions)])
+    combined_context = "\n\n".join(chunks)
+    prompt = CHUNK_PROMPT_TEMPLATE.format(context=combined_context, query=question_block)
+    answer = call_mistral(prompt)
+    return [a.strip() for a in answer.split("\n") if a.strip()]
 
-KEY_LINE_RX = re.compile(
-    r'(\b\d+\s*(day|days|month|months|year|years|%)\b|sub-?limit|room rent|ICU|AYUSH|grace|waiting|'
-    r'deductible|co-?pay|exclusion|PED|check[-\s]?up|sum insured|premium|pre[-\s]?auth|pre[-\s]?existing)',
-    re.I
-)
 
-def _harvest_numeric_lines(text: str, max_lines=60) -> str:
-    seen, out = set(), []
-    for ln in (l.strip() for l in text.splitlines() if l.strip()):
-        if KEY_LINE_RX.search(ln) and ln not in seen:
-            seen.add(ln); out.append(ln)
-            if len(out) >= max_lines: break
-    return "\n".join(out)
+# Groq fallback
+async def call_groq_on_chunks(chunks: List[str], questions: List[str]) -> List[str]:
+    question_block = "\n".join([f"{i+1}. {q}" for i, q in enumerate(questions)])
+    headers = {
+        "Authorization": f"Bearer {GROQ_API_KEY}",
+        "Content-Type": "application/json"
+    }
 
-def call_mistral_on_chunks(chunks: List[str], questions: List[str], params: dict) -> List[str]:
-    answers = []
-    for q in questions:
-        kchunks = _topk_chunks(q, chunks, k=4) or chunks[:4]
-        combined = "\n\n".join(kchunks)
-        evidence = _harvest_numeric_lines(combined)
-        context = combined + (f"\n\n--- Evidence ---\n{evidence}" if evidence else "")
-        prompt = CHUNK_PROMPT_TEMPLATE.format(context=context, web_snippets="", query=q)
-        ans = call_mistral(prompt, params).strip()
-        answers.append(ans)
-    return answers
-
-async def call_groq_on_chunks(chunks: List[str], questions: List[str], params: dict) -> List[str]:
-    # single-batch (one prompt per question) using top-k chunks too
-
-    answers = []
-    headers = {"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"}
-    url = "https://api.groq.com/openai/v1/chat/completions"
-
-    async def ask(q: str):
-        kchunks = _topk_chunks(q, chunks, k=4) or chunks[:4]
-        combined = "\n\n".join(kchunks)
-        evidence = _harvest_numeric_lines(combined)
-        context = combined + (f"\n\n--- Evidence ---\n{evidence}" if evidence else "")
-        prompt = CHUNK_PROMPT_TEMPLATE.format(context=context, web_snippets="", query=q)
+    async def call_chunk(chunk):
+        prompt = CHUNK_PROMPT_TEMPLATE.format(context=chunk, query=question_block)
         payload = {
             "model": "meta-llama/llama-4-scout-17b-16e-instruct",
-            "temperature": params.get("temperature", 0.3),
+            "temperature": 0.3,
             "top_p": 1,
-            "max_tokens": params.get("max_tokens", 1000),
-            "messages": [{"role": "user", "content": prompt}],
+            "max_tokens": 1000,
+            "messages": [{"role": "user", "content": prompt}]
         }
-        r = await ASYNC_CLIENT.post(url, headers=headers, json=payload, timeout=params.get("timeout", 20))
-        r.raise_for_status()
-        return r.json()["choices"][0]["message"]["content"].strip()
+        async with httpx.AsyncClient() as client:
+            res = await client.post("https://api.groq.com/openai/v1/chat/completions", headers=headers, json=payload, timeout=20)
+            res.raise_for_status()
+            return res.json()["choices"][0]["message"]["content"]
 
-    results = await asyncio.gather(*[ask(q) for q in questions])
-    answers.extend(results)
-    return answers
+    responses = await asyncio.gather(*[call_chunk(chunk) for chunk in chunks])
+    all_answers = "\n".join(responses)
+    return [a.strip() for a in all_answers.split("\n") if a.strip()]
 
-# ---------------- Routes ----------------
+def solve_puzzle_with_llm(pdf_text: str, instruction_results: list, page_count: int) -> str:
+    """
+    Send full pdf_text + instruction_results to LLM and return only the final answer.
+    Uses Mistral first, Groq as async fallback.
+    """
+    combined_results = json.dumps(instruction_results, indent=2) if instruction_results else "No instructions executed."
+    # Keep prompts within reasonable size -> but user asked to send "complete text" only for puzzle type.
+    # We'll still cap to avoid request failure, but you can increase if your model/context supports it.
+    pdf_for_prompt = pdf_text if len(pdf_text) < 300000 else pdf_text[:300000]  # ~300k chars cap (adjust as needed)
+    prompt = PUZZLE_PROMPT_TEMPLATE.format(pdf_text=pdf_for_prompt, instruction_results=combined_results)
+
+    # choose params
+    try:
+        resp = call_grok(prompt).strip()
+        # Ensure we return only the first non-empty line (final answer)
+        for line in resp.splitlines():
+            if line.strip():
+                return line.strip()
+        return resp.strip()
+    except Exception:
+        try:
+            loop = asyncio.get_event_loop()
+            resp = loop.run_until_complete(call_mistral(prompt))
+            for line in resp.splitlines():
+                if line.strip():
+                    return line.strip()
+            return resp.strip()
+        except Exception:
+            return "LLM_ERROR: Unable to get puzzle answer."
+
 
 
 @app.get("/")
 def read_root():
     return {"message": "PDF API is running"}
 
+# Main Endpoint
 @app.post("/api/v1/hackrx/run")
 async def run_analysis(request: RunRequest, authorization: str = Header(...)):
-    print(f"🔍 Processing request for {len(request.questions)} questions on {request.documents}")
-    
+    print(request)
     if authorization != f"Bearer {API_TOKEN}":
         raise HTTPException(status_code=401, detail="Unauthorized")
+
     try:
-        start = time.time()
+        start_time = time.time()
 
-        full_text, page_count, title = extract_text_from_pdf_url(request.documents)
+        is_pdf = False
+        try:
+            head = REQUESTS_SESSION.head(request.documents, allow_redirects=True, timeout=8)
+            ctype = head.headers.get("content-type", "").lower()
+            if "application/pdf" in ctype:
+                is_pdf = True
+        except Exception:
+            # if HEAD fails, fall back to extension detection
+            if request.documents.lower().endswith(".pdf"):
+                is_pdf = True
+
+        if is_pdf:
+            full_text, page_count, title = extract_text_from_pdf_url(request.documents)
+            is_web = False
+        else:
+            full_text, page_count, title = extract_text_from_web_url(request.documents)
+            is_web = True
+
+
+
+        # full_text, page_count, title = extract_text_from_pdf_url(request.documents)
         chunks = split_text(full_text) if full_text else []
+        question_block = "\n".join([f"{i+1}. {q}" for i, q in enumerate(request.questions)])
 
-        # <= 100 pages: full context (Mistral primary)
+        instruction_results = find_and_execute_instructions(full_text) if full_text else []
+        puzzle_answer = None
+        if instruction_results:
+            # keep existing behavior: we may still solve puzzle but do not return only final answer by default
+            puzzle_answer = solve_puzzle_with_llm(full_text, instruction_results, page_count)
+            return {"answer": puzzle_answer}
 
 
+        if is_web:
+            try:
+                prompt = FULL_PROMPT_TEMPLATE.format(context=full_text, query=question_block)
+                resp = call_mistral(prompt)
+                answers = [re.sub(r"^\d+[\.\)]\s*", "", a.strip()) for a in resp.split("\n") if a.strip()]
+                return {"answers": answers}
+            except Exception:
+                try:
+                    answers = await call_groq_on_chunks([full_text], request.questions)
+                    return {"answers": answers}
+                except Exception:
+                    raise HTTPException(status_code=500, detail="Both LLMs failed for webpage content.")
+
+
+
+        # Case 1: Full PDF (<= 100 pages)
         if page_count <= 100:
             try:
-                m_params = choose_mistral_params(page_count, full_text)
-                prompt = FULL_PROMPT_TEMPLATE.format(context=full_text, query=make_question_block(request.questions))
-                resp = call_mistral(prompt, m_params)
-                answers = [re.sub(r"^\d+[\.\)]\s*", "", a.strip()) for a in resp.split("\n") if a.strip()]
+                prompt = FULL_PROMPT_TEMPLATE.format(context=full_text, query=question_block)
+                response = call_mistral(prompt)
+                answers = [re.sub(r"^\d+[\.\)]\s*", "", a.strip()) for a in response.split("\n") if a.strip()]
                 return {"answers": answers}
             except Exception:
-                try:
-                    g_params = choose_groq_params(page_count, full_text)
-                    answers = await call_groq_on_chunks([full_text], request.questions, g_params)
-                    return {"answers": answers}
-                except Exception:
-                    raise HTTPException(status_code=500, detail="Both LLMs failed on full content.")
+                raise HTTPException(status_code=500, detail="Mistral failed on full content.")
 
-        # 101–200 pages: chunked (Mistral primary, Groq secondary)
-
-
+        # Case 2: Chunked PDF (<= 200 pages)
         elif page_count <= 200:
             try:
-                m_params = choose_mistral_params(page_count, "\n\n".join(chunks))
-                answers = call_mistral_on_chunks(chunks, request.questions, m_params)
+                answers = call_mistral_on_chunks(chunks, request.questions)
                 return {"answers": answers}
-            except Exception:
+            except:
                 try:
-                    g_params = choose_groq_params(page_count, "\n\n".join(chunks))
-                    answers = await call_groq_on_chunks(chunks, request.questions, g_params)
+                    answers = await call_groq_on_chunks(chunks, request.questions)
                     return {"answers": answers}
-                except Exception:
+                except:
                     raise HTTPException(status_code=500, detail="All LLMs failed for chunks.")
 
-        # > 200 pages: public info/title path (Mistral primary, Groq secondary)
-
-
+        # Case 3: Large (> 200 pages) → Use title and public info
         else:
             try:
-                m_params = choose_mistral_params(page_count, title)
-                prompt = WEB_PROMPT_TEMPLATE.format(title=title, query=make_question_block(request.questions))
-                resp = call_mistral(prompt, m_params)
-                answers = [re.sub(r"^\d+[\.\)]\s*", "", a.strip()) for a in resp.split("\n") if a.strip()]
+                prompt = WEB_PROMPT_TEMPLATE.format(title=title, query=question_block)
+                response = call_mistral(prompt)
+                answers = [re.sub(r"^\d+[\.\)]\s*", "", a.strip()) for a in response.split("\n") if a.strip()]
                 return {"answers": answers}
-            except Exception:
+            except:
                 try:
-                    g_params = choose_groq_params(page_count, title)
-                    answers = await call_groq_on_chunks([title], request.questions, g_params)
+                    answers = await call_groq_on_chunks([title], request.questions)
                     return {"answers": answers}
-                except Exception:
+                except:
                     raise HTTPException(status_code=500, detail="All LLMs failed for >200 page fallback.")
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
     finally:
-        print(f"⏱ Total processing time: {round(time.time() - start, 2)}s")
+        print(f"⏱️ Total processing time: {round(time.time() - start_time, 2)}s")
