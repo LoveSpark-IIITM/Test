@@ -9,3 +9,4 @@ pillow
 pytesseract
 groq
 urllib3
+beautifulsoup4
